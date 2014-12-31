@@ -1,0 +1,93 @@
+--- mail_handler.rb.orig	2014-11-13 09:57:30.678711672 +0800
++++ mail_handler.rb     	2014-06-20 13:42:49.079090248 +0800
+@@ -126,6 +126,7 @@
+   MESSAGE_ID_RE = %r{^<?redmine\.([a-z0-9_]+)\-(\d+)\.\d+@}
+   ISSUE_REPLY_SUBJECT_RE = %r{\[[^\]]*#(\d+)\]}
+   MESSAGE_REPLY_SUBJECT_RE = %r{\[[^\]]*msg(\d+)\]}
++  MESSAGE_CREATE_SUBJECT = %r{^Forum.*\[([^\]]+)\] ?(.*)}
+ 
+   def dispatch
+     headers = [email.in_reply_to, email.references].flatten.compact
+@@ -142,6 +143,8 @@
+       receive_issue_reply(m[1].to_i)
+     elsif m = subject.match(MESSAGE_REPLY_SUBJECT_RE)
+       receive_message_reply(m[1].to_i)
++    elsif m = subject.match(MESSAGE_CREATE_SUBJECT)
++      receive_message(m[1],m[2])
+     else
+       dispatch_to_default
+     end
+@@ -208,9 +211,11 @@
+     end
+     issue.safe_attributes = issue_attributes_from_keywords(issue)
+     issue.safe_attributes = {'custom_field_values' => custom_field_values_from_keywords(issue)}
+-    journal.notes = cleaned_up_text_body
++    journal.notes = cleaned_up_text_body.gsub(%r{(!end|From:[\w\W]*?Sent:|On.*?redmine@tymphany)[\w\W]*},'')
+     add_attachments(issue)
+     issue.save!
++    add_watchers(issue)
++    issue.save!
+     if logger && logger.info
+       logger.info "MailHandler: issue ##{issue.id} updated by #{user}"
+     end
+@@ -225,6 +230,27 @@
+     end
+   end
+ 
++  # Create a message via email
++  def receive_message(board, subject)
++    #project &&= Project.find_by_name(project[0..-4])
++    project = target_project
++    board = Board.find_by_name_and_project_id(board, project.id)
++
++    #check permission
++    unless @@handler_options[:no_permission_check]
++      raise UnanthorizedAction unless user.allowed_to?(:add_messages, project)
++    end
++    message = Message.new(:author => user, :board => board)
++    message.subject = subject
++    message.content = cleaned_up_text_body
++    add_watchers(message)
++    message.save!
++    add_attachments(message)
++
++    logger.info "MailHandler: message #{message.id} - \"#{message.subject}\" created by #{user}" if logger && logger.info
++    message
++  end
++
+   # Receives a reply to a forum message
+   def receive_message_reply(message_id)
+     message = Message.find_by_id(message_id)
+@@ -237,16 +263,21 @@
+ 
+       if !message.locked?
+         reply = Message.new(:subject => cleaned_up_subject.gsub(%r{^.*msg\d+\]}, '').strip,
+-                            :content => cleaned_up_text_body)
++                            :content => cleaned_up_text_body.gsub(%r{(!end|From:[\w\W]*?Sent|On.*?redmine@tymphany)[\w\W]*},''))
+         reply.author = user
+         reply.board = message.board
++        add_watchers(message)
+         message.children << reply
+         add_attachments(reply)
+-        reply
++        #if logger && logger.info
++         # logger.info "MailHandler: message ##{message.id} - #{reply.subject} created by #{user} in reply to message ##{message.parent_id}"
++        #end
+       else
+         if logger && logger.info
++          #logger.info "MailHandler: message #{message.id} - \"#{reply.subject}\" created by #{user}"
+           logger.info "MailHandler: ignoring reply from [#{sender_email}] to a locked topic"
+         end
++        reply
+       end
+     end
+   end
+@@ -266,7 +297,7 @@
+   # Adds To and Cc as watchers of the given object if the sender has the
+   # appropriate permission
+   def add_watchers(obj)
+-    if user.allowed_to?("add_#{obj.class.name.underscore}_watchers".to_sym, obj.project)
++    if user.allowed_to?("add_#{obj.class.name.underscore}_watchers".to_sym, obj.project) || obj.is_a?(Message)
+       addresses = [email.to, email.cc].flatten.compact.uniq.collect {|a| a.strip.downcase}
+       unless addresses.empty?
+         watchers = User.active.where('LOWER(mail) IN (?)', addresses).all
